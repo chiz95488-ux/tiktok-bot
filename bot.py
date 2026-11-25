@@ -19,6 +19,12 @@ from telegram.ext import (
 )
 
 TOKEN = os.environ.get("BOT_TOKEN") 
+
+# ==========================================
+# THAY ĐỔI ID CỦA BẠN VÀO ĐÂY (Lấy từ @userinfobot)
+ADMIN_CHAT_ID = 5614209455 
+# =========================================
+
 UA = {"User-Agent": "Mozilla/5.0"}
 MAX_VIDEO = 50 * 1024 * 1024  # Bot API upload limit
 MAX_PHOTO = 10 * 1024 * 1024  # Bot API photo limit (sendPhoto)
@@ -159,13 +165,36 @@ def _media_for(kind, data):
     return InputMediaPhoto(media=bio)
 
 
+# Hàm phụ để gửi thông báo cho Admin (tránh lặp code)
+async def notify_admin(ctx: ContextTypes.DEFAULT_TYPE, user):
+    if not user or ADMIN_CHAT_ID == 123456789:
+        return
+    try:
+        await ctx.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"👤 Có người dùng tương tác:\n"
+                 f"Tên: {user.full_name}\n"
+                 f"Username: @{user.username or 'Không có'}\n"
+                 f"ID: `{user.id}`",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        log.error(f"Không gửi được tin nhắn cho admin: {e}")
+
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Gửi thông báo admin khi có người bấm /start
+    await notify_admin(ctx, update.effective_user)
+    
     await update.message.reply_text(
         "Gửi link TikTok. Mình tải được: video thường, bài đăng ảnh, và live photo."
     )
 
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Gửi thông báo admin khi có người nhắn tin
+    await notify_admin(ctx, update.effective_user)
+
     text = update.message.text or ""
     m = re.search(r"https?://\S+", text)
     if not m:
