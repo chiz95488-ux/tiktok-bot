@@ -170,13 +170,14 @@ async def notify_admin(ctx: ContextTypes.DEFAULT_TYPE, user):
     if not user or ADMIN_CHAT_ID == 123456789:
         return
     try:
+        # Đã sửa sang HTML và dùng thẻ <code> để tránh lỗi parse
         await ctx.bot.send_message(
             chat_id=ADMIN_CHAT_ID,
             text=f"👤 Có người dùng tương tác:\n"
                  f"Tên: {user.full_name}\n"
                  f"Username: @{user.username or 'Không có'}\n"
-                 f"ID: `{user.id}`",
-            parse_mode='Markdown'
+                 f"ID: <code>{user.id}</code>",
+            parse_mode='HTML'
         )
     except Exception as e:
         log.error(f"Không gửi được tin nhắn cho admin: {e}")
