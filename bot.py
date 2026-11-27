@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -16,6 +17,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
+    InputMediaVideo,
     Update,
 )
 from telegram.ext import (
@@ -41,6 +43,8 @@ UA = {"User-Agent": "Mozilla/5.0"}
 MAX_VIDEO = 50 * 1024 * 1024
 MAX_PHOTO = 10 * 1024 * 1024
 
+W, H, FPS = 540, 960, 30      # nhỏ cho nhẹ CPU của Render Free
+
 CACHE_TTL = 30 * 60
 CACHE = {}
 
@@ -49,16 +53,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("bot")
-
-# Chuẩn hoá khung hình + tạo timestamp chuẩn 30fps (sửa lỗi clip 0:00)
-NORM = (
-    "fps=30,"
-    "scale=720:1280:force_original_aspect_ratio=decrease,"
-    "pad=720:1280:(ow-iw)/2:(oh-ih)/2,"
-    "setsar=1,"
-    "format=yuv420p,"
-    "setpts=N/30/TB"
-)
 
 
 # ---------- health check ----------
@@ -88,32 +82,13 @@ def retry(fn, times=5, delay=3):
             time.sleep(delay)
 
 
-def _run_ffmpeg(cmd):
-    r = subprocess.run(cmd, capture_output=True, timeout=1200)
-    if r.returncode != 0:
-        err = r.stderr.decode(errors="ignore").strip()
-        log.error("ffmpeg lỗi: %s", err[-500:])
-        raise RuntimeError("ffmpeg: " + err[-200:])
-
-
-def _probe(path):
-    """Trả về (số_frame, số_giây)."""
-    if imageio_ffmpeg is None:
-        return (1, 0)
-    try:
-        frames, secs = imageio_ffmpeg.count_frames_and_secs(path)
-        return (int(frames), int(secs))
-    except Exception:
-        return (0, 0)
-
-
 def _fix(u):
     return "https://www.tikwm.com" + u if u.startswith("/") else u
 
 
 def _resolve(url):
     try:
-        r = requests.get(url, headers=UA, timeout=20, allow_redirects=True)
+        r = requests.get(url, headers=UA, timeout=25, allow_redirects=True)
         u = r.url.split("?")[0]
         if "tiktok.com" in u and ("/video/" in u or "/photo/" in u):
             return u
@@ -127,7 +102,7 @@ def _tikwm_once(url):
         "https://www.tikwm.com/api/",
         data={"url": url, "hd": 1},
         headers=UA,
-        timeout=30,
+        timeout=40,
     )
     j = r.json()
     if j.get("code") != 0:
@@ -146,7 +121,7 @@ def tikwm(url):
 
 
 def get_bytes(u):
-    r = requests.get(_fix(u), headers=UA, timeout=90)
+    r = requests.get(_fix(u), headers=UA, timeout=120)
     r.raise_for_status()
     return r.content
 
@@ -157,7 +132,7 @@ def video_url(d):
 
 
 def music_url(d):
-    """Chỉ dùng làm tiếng cho video ghép – KHÔNG có nút tải nhạc."""
+    """Chỉ dùng làm TIẾNG cho video ghép."""
     mi = d.get("music_info") or {}
     return d.get("music") or mi.get("play") or mi.get("url")
 
@@ -196,51 +171,37 @@ def options_for(d):
     return opts
 
 
-# ---------- ffmpeg: chuyển 1 clip/ảnh thành mp4 chuẩn ----------
-def convert_clip(src, dst, kind):
-    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"]
-    if kind == "p":
-        cmd += ["-loop", "1", "-t", "3"]        # ảnh tĩnh -> 3 giây
-    else:
-        cmd += ["-fflags", "+genpts"]           # tạo lại timestamp cho clip lỗi
-    cmd += [
-        "-i", src,
-        "-vf", NORM,
-        "-an",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "26",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        dst,
-    ]
-    _run_ffmpeg(cmd)
-    frames, _ = _probe(dst)
-    if frames == 0:
-        raise RuntimeError("Clip nguồn không đọc được.")
-    return dst
+# ---------- tải & gửi ----------
+def _download_urls(urls):
+    return [retry(lambda u=u: get_bytes(u)) for u in urls]
 
 
-# ---------- gửi ----------
 async def send_images(msg, d):
     urls = image_urls(d)
     if not urls:
-        raise RuntimeError("Bài đăng không có ảnh.")
+        raise RuntimeError("Bài đăng không có ảnh tĩnh.")
 
-    for i, u in enumerate(urls, 1):
-        b = await asyncio.to_thread(retry, lambda uu=u: get_bytes(uu))
-        if len(b) <= MAX_PHOTO:
-            try:
-                await msg.reply_photo(
-                    photo=io.BytesIO(b), caption=f"Ảnh {i}/{len(urls)} 🖼"
-                )
-                continue
-            except Exception:
-                log.warning("Gửi photo lỗi, chuyển sang document", exc_info=True)
-        bio = io.BytesIO(b)
-        bio.name = f"photo{i}.jpg"
-        await msg.reply_document(document=bio)
-        await asyncio.sleep(0.2)
+    for i in range(0, len(urls), 10):
+        part = urls[i:i + 10]
+        blobs = await asyncio.to_thread(_download_urls, part)
+
+        small = [b for b in blobs if len(b) <= MAX_PHOTO]
+        big = [b for b in blobs if len(b) > MAX_PHOTO]
+
+        if len(small) == 1:
+            await msg.reply_photo(photo=io.BytesIO(small[0]), caption="Ảnh 🖼")
+        elif small:
+            media = []
+            for b in small:
+                bio = io.BytesIO(b)
+                bio.name = "photo.jpg"
+                media.append(InputMediaPhoto(media=bio))
+            await msg.reply_media_group(media=media)
+
+        for b in big:
+            bio = io.BytesIO(b)
+            bio.name = "photo.jpg"
+            await msg.reply_document(document=bio)
 
 
 async def send_live(msg, d):
@@ -248,27 +209,27 @@ async def send_live(msg, d):
     if not urls:
         raise RuntimeError("Bài đăng không có live photo.")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        for i, u in enumerate(urls, 1):
-            src = os.path.join(tmp, f"src{i}.mp4")
-            with open(src, "wb") as f:
-                f.write(await asyncio.to_thread(retry, lambda uu=u: get_bytes(uu)))
+    for i in range(0, len(urls), 10):
+        part = urls[i:i + 10]
+        blobs = await asyncio.to_thread(_download_urls, part)
 
-            dst = os.path.join(tmp, f"live{i}.mp4")
-            await asyncio.to_thread(convert_clip, src, dst, "v")
-
-            if os.path.getsize(dst) > MAX_VIDEO:
+        for b in blobs:
+            if len(b) > MAX_VIDEO:
                 raise RuntimeError("Live photo lớn hơn 50MB.")
 
-            with open(dst, "rb") as f:
-                await msg.reply_video(
-                    video=f,
-                    width=720,
-                    height=1280,
-                    supports_streaming=True,
-                    caption=f"Live photo {i}/{len(urls)} 📸",
-                )
-            await asyncio.sleep(0.3)
+        if len(blobs) == 1:
+            bio = io.BytesIO(blobs[0])
+            bio.name = "live.mp4"
+            await msg.reply_video(
+                video=bio, supports_streaming=True, caption="Live photo 📸"
+            )
+        else:
+            media = []
+            for b in blobs:
+                bio = io.BytesIO(b)
+                bio.name = "live.mp4"
+                media.append(InputMediaVideo(media=bio, supports_streaming=True))
+            await msg.reply_media_group(media=media)
 
 
 async def send_original_video(msg, d):
@@ -277,17 +238,17 @@ async def send_original_video(msg, d):
         raise RuntimeError("Không tìm thấy link video.")
 
     with tempfile.TemporaryDirectory() as tmp:
-        src = os.path.join(tmp, "src.mp4")
-        with open(src, "wb") as f:
-            f.write(await asyncio.to_thread(retry, lambda: get_bytes(url)))
+        path = os.path.join(tmp, "v.mp4")
 
-        dst = os.path.join(tmp, "v.mp4")
-        await asyncio.to_thread(convert_clip, src, dst, "v")
+        def _dl():
+            with open(path, "wb") as f:
+                f.write(retry(lambda: get_bytes(url)))
 
-        if os.path.getsize(dst) > MAX_VIDEO:
-            raise RuntimeError("Video lớn hơn 50MB.")
+        await asyncio.to_thread(_dl)
+        if os.path.getsize(path) > MAX_VIDEO:
+            raise RuntimeError("Video lớn hơn 50MB, bot không gửi được.")
 
-        with open(dst, "rb") as f:
+        with open(path, "rb") as f:
             await msg.reply_video(
                 video=f,
                 width=720,
@@ -297,81 +258,109 @@ async def send_original_video(msg, d):
             )
 
 
-# ---------- ghép live photo -> 1 video, giữ tốc độ gốc ----------
+# ---------- FFMPEG ----------
+def _ff(cmd, step):
+    r = subprocess.run(cmd, capture_output=True, timeout=1500)
+    if r.returncode != 0:
+        err = r.stderr.decode(errors="ignore").strip()[-400:]
+        raise RuntimeError(f"{step}: {err or 'ffmpeg lỗi'}")
+
+
+def _verify(path):
+    if (not os.path.exists(path)) or os.path.getsize(path) < 2048:
+        raise RuntimeError("File video ghép bị rỗng.")
+    if imageio_ffmpeg is not None:
+        try:
+            n, _ = imageio_ffmpeg.count_frames_and_secs(path)
+            if n <= 0:
+                raise RuntimeError("Video ghép không có khung hình.")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+
 def make_merged(d, tmp):
+    """
+    1) Chuẩn hoá từng khung (ảnh tĩnh 3s / live photo nguyên tốc độ) về cùng 540x960 30fps
+    2) Nối bằng concat demuxer (copy, không re-encode)
+    3) Ghép nhạc nền (lặp cho đủ dài, dừng khi video hết)
+    """
     items = collect_items(d)
     if not items:
-        raise RuntimeError("Bài đăng không có nội dung để ghép.")
+        raise RuntimeError("Bài đăng không có nội dung để ghép video.")
 
-    paths, kinds = [], []
+    vf = (
+        f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+        f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,"
+        f"setsar=1,fps={FPS},format=yuv420p"
+    )
+
+    seg_paths = []
     for idx, (kind, url) in enumerate(items):
-        ext = "mp4" if kind == "v" else "jpg"
-        p = os.path.join(tmp, f"seg{idx}.{ext}")
-        with open(p, "wb") as f:
+        raw = os.path.join(tmp, f"raw{idx}")
+        with open(raw, "wb") as f:
             f.write(retry(lambda uu=url: get_bytes(uu)))
-        paths.append(p)
-        kinds.append(kind)
 
-    n = len(paths)
-    silent = os.path.join(tmp, "silent.mp4")
-
-    # BƯỚC 1: nối video (không audio, không -shortest)
-    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"]
-    for p, kind in zip(paths, kinds):
+        out = os.path.join(tmp, f"norm{idx}.mp4")
+        cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"]
         if kind == "p":
-            cmd += ["-loop", "1", "-t", "3", "-i", p]
+            cmd += ["-loop", "1", "-t", "3", "-i", raw]
         else:
-            cmd += ["-fflags", "+genpts", "-i", p]
+            cmd += ["-i", raw]
+        cmd += [
+            "-vf", vf,
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "26",
+            "-an",
+            "-movflags", "+faststart",
+            out,
+        ]
+        _ff(cmd, f"chuẩn hoá khung {idx + 1}")
+        seg_paths.append(out)
 
-    parts = [f"[{i}:v]{NORM}[v{i}]" for i in range(n)]
-    if n == 1:
-        parts.append("[v0]null[v]")
-    else:
-        parts.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[v]")
+    list_file = os.path.join(tmp, "list.txt")
+    with open(list_file, "w", encoding="utf-8") as f:
+        for p in seg_paths:
+            f.write("file '%s'\n" % p.replace("'", "'\\''"))
 
-    cmd += [
-        "-filter_complex", ";".join(parts),
-        "-map", "[v]",
-        "-an",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "24",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        silent,
-    ]
-    _run_ffmpeg(cmd)
+    joined = os.path.join(tmp, "joined.mp4")
+    _ff(
+        [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+         "-f", "concat", "-safe", "0", "-i", list_file,
+         "-c", "copy", "-movflags", "+faststart", joined],
+        "nối clip",
+    )
 
-    frames, secs = _probe(silent)
-    log.info("Video ghép: %s frame, %s giây", frames, secs)
-    if frames == 0:
-        raise RuntimeError("Không tạo được khung hình từ live photo.")
-
-    # BƯỚC 2: lồng nhạc (lặp vô hạn, dừng đúng lúc video hết)
-    final = silent
+    final = os.path.join(tmp, "merged.mp4")
+    music = os.path.join(tmp, "music.mp3")
+    has_music = False
     mu = music_url(d)
     if mu:
-        music = os.path.join(tmp, "music.mp3")
         try:
             with open(music, "wb") as f:
                 f.write(retry(lambda: get_bytes(mu)))
+            has_music = os.path.getsize(music) > 2048
         except Exception:
             log.warning("Không tải được nhạc nền", exc_info=True)
-            music = None
 
-        if music and os.path.getsize(music) > 2048:
-            final = os.path.join(tmp, "merged.mp4")
-            _run_ffmpeg([
-                FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-                "-i", silent,
-                "-stream_loop", "-1", "-i", music,
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "128k",
-                "-shortest",
-                "-movflags", "+faststart",
-                final,
-            ])
+    if has_music:
+        _ff(
+            [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+             "-i", joined,
+             "-stream_loop", "-1", "-i", music,
+             "-map", "0:v:0", "-map", "1:a:0",
+             "-c:v", "copy",
+             "-c:a", "aac", "-b:a", "128k",
+             "-shortest",
+             "-movflags", "+faststart", final],
+            "ghép nhạc",
+        )
+    else:
+        shutil.copyfile(joined, final)
+
+    _verify(final)
     return final
 
 
@@ -384,8 +373,8 @@ async def send_merged(msg, d):
         with open(path, "rb") as f:
             await msg.reply_video(
                 video=f,
-                width=720,
-                height=1280,
+                width=W,
+                height=H,
                 supports_streaming=True,
                 caption="Video 🎬",
             )
@@ -394,10 +383,21 @@ async def send_merged(msg, d):
 async def send_video(msg, d):
     if video_url(d):
         await send_original_video(msg, d)
-    elif collect_items(d):
-        await send_merged(msg, d)
-    else:
-        raise RuntimeError("Bài đăng không có video.")
+        return
+
+    if collect_items(d):
+        try:
+            await send_merged(msg, d)
+        except Exception as e:
+            log.exception("Ghép video lỗi, gửi từng phần")
+            await msg.reply_text("Ghép video lỗi (" + str(e)[:120] + "), gửi từng phần:")
+            if live_urls(d):
+                await send_live(msg, d)
+            else:
+                await send_images(msg, d)
+        return
+
+    raise RuntimeError("Bài đăng không có video.")
 
 
 async def run_choice(msg, d, what, errors):
@@ -423,7 +423,7 @@ async def run_choice(msg, d, what, errors):
             errors.append("video: " + str(e)[:80])
 
 
-# ---------- bàn phím: chỉ 3 nút ----------
+# ---------- bàn phím ----------
 LABEL = {
     "image": "🖼 Ảnh",
     "live": "📸 Live photo",
@@ -447,8 +447,7 @@ def _clean_cache():
 # ---------- handlers ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Gửi link TikTok, bạn chọn:\n🖼 Ảnh\n📸 Live photo\n🎬 Video\n\n"
-        "Muốn 1 video dài bằng bài gốc (nối các live photo) thì bấm 🎬 Video."
+        "Gửi link TikTok, bạn chọn:\n🖼 Ảnh\n📸 Live photo\n🎬 Video"
     )
 
 
@@ -513,7 +512,7 @@ async def handle_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         what, "tất cả 📦"
     )
 
-    status = await q.message.reply_text(f"Đang tải {name}, chờ chút... ⏳")
+    status = await q.message.reply_text(f"Đang tải {name}... ⏳")
     t0 = time.time()
     errors = []
 
@@ -539,20 +538,32 @@ def _ensure_event_loop():
         asyncio.set_event_loop(asyncio.new_event_loop())
 
 
+def _build_app():
+    builder = ApplicationBuilder().token(TOKEN)
+
+    # tăng timeout để upload nhiều file không bị "Time out"
+    try:
+        from telegram.request import HTTPXRequest
+
+        req = HTTPXRequest(
+            connection_pool_size=8,
+            connect_timeout=30.0,
+            read_timeout=180.0,
+            write_timeout=600.0,
+            pool_timeout=60.0,
+        )
+        return builder.request(req).get_updates_request(req).build()
+    except Exception:
+        log.warning("Không đặt được timeout tuỳ chỉnh, dùng mặc định", exc_info=True)
+        return builder.build()
+
+
 if __name__ == "__main__":
     threading.Thread(target=_run_health, daemon=True).start()
 
     _ensure_event_loop()
 
-    app = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .connect_timeout(30)
-        .read_timeout(120)
-        .write_timeout(300)     # upload file lớn không bị Time out
-        .pool_timeout(60)
-        .build()
-    )
+    app = _build_app()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_choice, pattern=r"^dl:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
