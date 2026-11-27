@@ -3,6 +3,8 @@ import io
 import logging
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -18,22 +20,40 @@ from telegram.ext import (
     filters,
 )
 
-TOKEN = os.environ.get("BOT_TOKEN") 
+TOKEN = os.environ.get("BOT_TOKEN")
 
 # ==========================================
-# THAY ĐỔI ID CỦA BẠN VÀO ĐÂY (Lấy từ @userinfobot)
-ADMIN_CHAT_ID = 5614209455 
-# =========================================
+ADMIN_CHAT_ID = 5614209455
+# ==========================================
 
 UA = {"User-Agent": "Mozilla/5.0"}
-MAX_VIDEO = 50 * 1024 * 1024  # Bot API upload limit
-MAX_PHOTO = 10 * 1024 * 1024  # Bot API photo limit (sendPhoto)
+MAX_VIDEO = 50 * 1024 * 1024
+MAX_PHOTO = 10 * 1024 * 1024
+
+W, H = 720, 1280
+FPS = 30
+STATIC_DEFAULT = 3.0        # giây cho ảnh tĩnh khi không có nhạc
+
+# "merged" = gộp cả bài thành 1 mp4 (mặc định)
+# "album"  = gửi từng slide
+MODE = os.environ.get("MODE", "merged").lower()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("bot")
+
+
+# ---------- semaphore lazy (tránh bind sai event loop) ----------
+SEM = None
+
+
+def sem():
+    global SEM
+    if SEM is None:
+        SEM = asyncio.Semaphore(3)
+    return SEM
 
 
 # ---------- health check cho Render ----------
@@ -52,6 +72,44 @@ def _run_health():
 # ---------------------------------------------
 
 
+# ---------- ffmpeg ----------
+FFMPEG = None
+
+
+def ffmpeg():
+    global FFMPEG
+    if FFMPEG:
+        return FFMPEG
+    FFMPEG = os.environ.get("FFMPEG_BIN") or "ffmpeg"
+    try:
+        subprocess.run([FFMPEG, "-version"], capture_output=True, check=True)
+        return FFMPEG
+    except Exception:
+        pass
+    try:
+        import imageio_ffmpeg
+        FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+        log.info("dùng ffmpeg bundled: %s", FFMPEG)
+        return FFMPEG
+    except Exception:
+        raise RuntimeError("Không có ffmpeg. Thêm 'imageio-ffmpeg' vào requirements.txt")
+
+
+def _exec(cmd):
+    p = subprocess.run(cmd, capture_output=True)
+    if p.returncode != 0:
+        raise RuntimeError("ffmpeg: " + p.stderr.decode("utf-8", "ignore")[-400:])
+
+
+def _duration(path):
+    p = subprocess.run([ffmpeg(), "-i", path], capture_output=True)
+    m = re.search(rb"Duration: (\d+):(\d+):(\d+\.\d+)", p.stderr or b"")
+    if not m:
+        return 0.0
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+
+
+# ---------- tikwm ----------
 def retry(fn, times=5, delay=3):
     for i in range(times):
         try:
@@ -106,6 +164,11 @@ def get_bytes(u):
     return r.content
 
 
+def save(u, path):
+    with open(path, "wb") as f:
+        f.write(get_bytes(u))
+
+
 def classify(d):
     if d.get("images") or d.get("live_images"):
         return "photo"
@@ -115,7 +178,7 @@ def classify(d):
 
 
 def collect_items(d):
-    """('p', url) ảnh tĩnh, ('v', url) live photo."""
+    """('p', url) ảnh tĩnh · ('v', url) clip live photo."""
     imgs = d.get("images") or []
     live = d.get("live_images") or []
     items = []
@@ -130,30 +193,97 @@ def collect_items(d):
     return items
 
 
+# ---------- gộp thành một video ----------
+def _fit(src, out, loop_img=False, dur=STATIC_DEFAULT):
+    vf = (
+        f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+        f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,fps={FPS}"
+    )
+    cmd = [ffmpeg(), "-y"]
+    if loop_img:
+        cmd += ["-loop", "1", "-t", f"{dur:.3f}"]
+    cmd += [
+        "-i", src, "-vf", vf, "-an",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-pix_fmt", "yuv420p", out,
+    ]
+    _exec(cmd)
+
+
+def build_full_video(d, workdir, out_path):
+    """Ghép mọi slide + nhạc thành một mp4 liền mạch."""
+    items = collect_items(d)
+    if not items:
+        raise RuntimeError("Bài đăng không có ảnh hay live photo nào.")
+
+    # tải nhạc trước để tính thời lượng mỗi ảnh tĩnh
+    audio = None
+    music = (d.get("music_info") or {}).get("play")
+    if music:
+        p = os.path.join(workdir, "audio.mp3")
+        try:
+            save(music, p)
+            audio = p
+        except Exception as e:
+            log.warning("không tải được nhạc: %s", e)
+
+    total = _duration(audio) if audio else 0.0
+    per = total / len(items) if total else STATIC_DEFAULT
+    per = max(1.2, min(per, 8.0))
+
+    clips = []
+    for i, (kind, url) in enumerate(items):
+        src = os.path.join(workdir, f"src_{i:02d}." + ("mp4" if kind == "v" else "jpg"))
+        retry(lambda u=url, s=src: save(u, s))
+        out = os.path.join(workdir, f"clip_{i:02d}.mp4")
+        _fit(src, out, loop_img=(kind == "p"), dur=per)
+        clips.append(out)
+
+    listfile = os.path.join(workdir, "list.txt")
+    with open(listfile, "w", encoding="utf-8") as f:
+        for c in clips:
+            f.write("file '%s'\n" % os.path.abspath(c).replace("'", "'\\''"))
+
+    joined = os.path.join(workdir, "joined.mp4")
+    _exec([ffmpeg(), "-y", "-f", "concat", "-safe", "0", "-i", listfile, "-c", "copy", joined])
+
+    if audio:
+        # apad: nhạc ngắn hơn video thì bù im lặng, -shortest dừng theo video
+        _exec([
+            ffmpeg(), "-y", "-i", joined, "-i", audio,
+            "-af", "apad",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-shortest", "-movflags", "+faststart", out_path,
+        ])
+    else:
+        shutil.move(joined, out_path)
+
+    # quá 50MB thì nén lại
+    if os.path.getsize(out_path) > MAX_VIDEO:
+        log.info("vượt 50MB, nén lại")
+        small = os.path.join(workdir, "small.mp4")
+        _exec([
+            ffmpeg(), "-y", "-i", out_path,
+            "-vf", "scale=540:960:force_original_aspect_ratio=decrease,"
+                   "pad=540:960:(ow-iw)/2:(oh-ih)/2:color=black",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+            "-c:a", "aac", "-b:a", "96k", small,
+        ])
+        shutil.move(small, out_path)
+
+    return out_path, len(items), _duration(out_path)
+
+
+# ---------- chế độ album ----------
 def prepare_photo(d):
     items = collect_items(d)
     if not items:
         raise RuntimeError("Bài đăng không có ảnh / live photo nào.")
     chunks = []
     for i in range(0, len(items), 10):
-        part = items[i : i + 10]
-        loaded = [(kind, retry(lambda u=url: get_bytes(u))) for kind, url in part]
-        chunks.append(loaded)
+        part = items[i:i + 10]
+        chunks.append([(k, retry(lambda u=u: get_bytes(u))) for k, u in part])
     return chunks
-
-
-def prepare_video(d, tmp):
-    url = d.get("hdplay") or d.get("play")
-    if not url:
-        raise RuntimeError("Không tìm thấy link tải video.")
-    path = os.path.join(tmp, "v.mp4")
-    retry(lambda: save(url, path))
-    return path
-
-
-def save(u, path):
-    with open(path, "wb") as f:
-        f.write(get_bytes(u))
 
 
 def _media_for(kind, data):
@@ -165,35 +295,69 @@ def _media_for(kind, data):
     return InputMediaPhoto(media=bio)
 
 
-# Hàm phụ để gửi thông báo cho Admin (tránh lặp code)
+async def send_album(msg, chunks):
+    for chunk in chunks:
+        for k, b in chunk:
+            limit = MAX_VIDEO if k == "v" else MAX_PHOTO
+            if len(b) > limit:
+                await msg.reply_text("Có file vượt giới hạn Telegram (ảnh 10MB / video 50MB).")
+                return
+        try:
+            if len(chunk) == 1:
+                k, b = chunk[0]
+                if k == "v":
+                    await msg.reply_video(video=io.BytesIO(b), supports_streaming=True)
+                else:
+                    await msg.reply_photo(photo=io.BytesIO(b))
+            else:
+                await msg.reply_media_group(media=[_media_for(k, b) for k, b in chunk])
+        except Exception as e:
+            # album trộn photo+video hay bị 400 → gửi lẻ
+            log.warning("album lỗi (%s), gửi lẻ", e)
+            for k, b in chunk:
+                if k == "v":
+                    await msg.reply_video(video=io.BytesIO(b), supports_streaming=True)
+                else:
+                    await msg.reply_photo(photo=io.BytesIO(b))
+
+
+# ---------- notify ----------
 async def notify_admin(ctx: ContextTypes.DEFAULT_TYPE, user):
     if not user or ADMIN_CHAT_ID == 123456789:
         return
     try:
-        # Đã sửa sang HTML và dùng thẻ <code> để tránh lỗi parse
         await ctx.bot.send_message(
             chat_id=ADMIN_CHAT_ID,
             text=f"👤 Có người dùng tương tác:\n"
                  f"Tên: {user.full_name}\n"
                  f"Username: @{user.username or 'Không có'}\n"
                  f"ID: <code>{user.id}</code>",
-            parse_mode='HTML'
+            parse_mode="HTML",
         )
     except Exception as e:
-        log.error(f"Không gửi được tin nhắn cho admin: {e}")
+        log.error("Không gửi được tin nhắn cho admin: %s", e)
 
 
+# ---------- handlers ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Gửi thông báo admin khi có người bấm /start
     await notify_admin(ctx, update.effective_user)
-    
     await update.message.reply_text(
-        "Gửi link TikTok. Mình tải được: video thường, bài đăng ảnh, và live photo."
+        "Gửi link TikTok. Mình tải được: video thường, bài đăng ảnh, và live photo.\n"
+        f"Chế độ hiện tại: {MODE}"
     )
 
 
+async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global MODE
+    arg = (ctx.args[0].lower() if ctx.args else "")
+    if arg in ("album", "merged"):
+        MODE = arg
+        await update.message.reply_text("Chế độ: " + MODE)
+    else:
+        await update.message.reply_text("Dùng: /mode merged | /mode album")
+
+
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Gửi thông báo admin khi có người nhắn tin
     await notify_admin(ctx, update.effective_user)
 
     text = update.message.text or ""
@@ -206,65 +370,68 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Mình chỉ xử lý link TikTok.")
         return
 
-    status = await update.message.reply_text("Đang tải... ⏳")
-    t0 = time.time()
+    async with sem():
+        status = await update.message.reply_text("Đang tải... ⏳")
+        t0 = time.time()
 
-    try:
-        data = await asyncio.to_thread(tikwm, link)
-        kind = classify(data)
-
-        if kind == "photo":
-            chunks = await asyncio.to_thread(prepare_photo, data)
-            for chunk in chunks:
-                for k, b in chunk:
-                    limit = MAX_VIDEO if k == "v" else MAX_PHOTO
-                    if len(b) > limit:
-                        await status.edit_text(
-                            "Có file vượt giới hạn Telegram (ảnh 10MB / video 50MB)."
-                        )
-                        return
-                if len(chunk) == 1:
-                    k, b = chunk[0]
-                    if k == "v":
-                        await update.message.reply_video(
-                            video=io.BytesIO(b), supports_streaming=True
-                        )
-                    else:
-                        await update.message.reply_photo(photo=io.BytesIO(b))
-                else:
-                    await update.message.reply_media_group(
-                        media=[_media_for(k, b) for k, b in chunk]
-                    )
-        else:
-            with tempfile.TemporaryDirectory() as tmp:
-                path = await asyncio.to_thread(prepare_video, data, tmp)
-                if os.path.getsize(path) > MAX_VIDEO:
-                    await status.edit_text("Video lớn hơn 50MB, bot không gửi được.")
-                    return
-                await status.edit_text("Đang gửi video...")
-                with open(path, "rb") as f:
-                    await update.message.reply_video(
-                        video=f,
-                        width=720,
-                        height=1280,
-                        supports_streaming=True,
-                        caption="Video của bạn đây! 🎬",
-                    )
-
-        await status.delete()
-        await update.message.reply_text("Xong trong %.1f giây." % (time.time() - t0))
-    except Exception as e:
-        log.exception("download failed")
         try:
-            await status.edit_text("Lỗi: " + str(e)[:200])
-        except Exception:
-            await update.message.reply_text("Lỗi: " + str(e)[:200])
+            data = await asyncio.to_thread(tikwm, link)
+            kind = classify(data)
 
+            if kind == "video":
+                tmpdir = tempfile.mkdtemp()
+                try:
+                    url = data.get("hdplay") or data.get("play")
+                    path = os.path.join(tmpdir, "v.mp4")
+                    await asyncio.to_thread(lambda: save(url, path))
 
-if __name__ == "__main__":
-    threading.Thread(target=_run_health, daemon=True).start()
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    log.info("Bot đang chạy...")
-    app.run_polling()
+                    if os.path.getsize(path) > MAX_VIDEO:
+                        sd = data.get("play")
+                        if sd and sd != url:
+                            await status.edit_text("HD quá 50MB, lấy bản SD...")
+                            await asyncio.to_thread(lambda: save(sd, path))
+
+                    if os.path.getsize(path) > MAX_VIDEO:
+                        await status.edit_text("Video lớn hơn 50MB, bot không gửi được.")
+                        return
+
+                    await status.edit_text("Đang gửi video...")
+                    with open(path, "rb") as f:
+                        await update.message.reply_video(
+                            video=f,
+                            supports_streaming=True,
+                            caption="Video của bạn đây! 🎬",
+                        )
+                finally:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+
+            elif MODE == "album":
+                chunks = await asyncio.to_thread(prepare_photo, data)
+                await send_album(update.message, chunks)
+
+            else:  # merged
+                tmpdir = tempfile.mkdtemp()
+                try:
+                    out = os.path.join(tmpdir, "full.mp4")
+                    await status.edit_text("Đang ghép slide... 🎞")
+                    out, n, dur = await asyncio.to_thread(build_full_video, data, tmpdir, out)
+
+                    if os.path.getsize(out) > MAX_VIDEO:
+                        await status.edit_text("Bản ghép vẫn quá 50MB, bot không gửi được.")
+                        return
+
+                    await status.edit_text("Đang gửi video...")
+                    title = (data.get("title") or "Live photo")[:180]
+                    with open(out, "rb") as f:
+                        await update.message.reply_video(
+                            video=f,
+                            width=W,
+                            height=H,
+                            duration=max(1, int(round(dur))),
+                            supports_streaming=True,
+                            caption=f"{title}\n{n} slide · {dur:.1f}s 🎞",
+                        )
+                finally:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+
+            await status.delete()
