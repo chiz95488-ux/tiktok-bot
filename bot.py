@@ -377,8 +377,26 @@ async def handle_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("edit status failed")
 
 
+# ---------- khởi động ----------
+def _ensure_event_loop():
+    """
+    Python 3.13+ / 3.14 không còn tự tạo event loop khi gọi asyncio.get_event_loop(),
+    khiến run_polling() của python-telegram-bot báo:
+    'RuntimeError: There is no current event loop in thread MainThread'.
+    Tạo sẵn loop để tránh lỗi này.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("loop closed")
+    except Exception:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+
 if __name__ == "__main__":
     threading.Thread(target=_run_health, daemon=True).start()
+
+    _ensure_event_loop()
 
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -386,4 +404,4 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     log.info("Bot đang chạy...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
