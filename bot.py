@@ -16,7 +16,6 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
-    InputMediaVideo,
     Update,
 )
 from telegram.ext import (
@@ -32,6 +31,7 @@ try:
     import imageio_ffmpeg
     FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:
+    imageio_ffmpeg = None
     FFMPEG = "ffmpeg"
 
 # ================= CẤU HÌNH =================
@@ -49,6 +49,16 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("bot")
+
+# Chuẩn hoá khung hình + tạo timestamp chuẩn 30fps (sửa lỗi clip 0:00)
+NORM = (
+    "fps=30,"
+    "scale=720:1280:force_original_aspect_ratio=decrease,"
+    "pad=720:1280:(ow-iw)/2:(oh-ih)/2,"
+    "setsar=1,"
+    "format=yuv420p,"
+    "setpts=N/30/TB"
+)
 
 
 # ---------- health check ----------
@@ -76,6 +86,25 @@ def retry(fn, times=5, delay=3):
             if i == times - 1:
                 raise
             time.sleep(delay)
+
+
+def _run_ffmpeg(cmd):
+    r = subprocess.run(cmd, capture_output=True, timeout=1200)
+    if r.returncode != 0:
+        err = r.stderr.decode(errors="ignore").strip()
+        log.error("ffmpeg lỗi: %s", err[-500:])
+        raise RuntimeError("ffmpeg: " + err[-200:])
+
+
+def _probe(path):
+    """Trả về (số_frame, số_giây)."""
+    if imageio_ffmpeg is None:
+        return (1, 0)
+    try:
+        frames, secs = imageio_ffmpeg.count_frames_and_secs(path)
+        return (int(frames), int(secs))
+    except Exception:
+        return (0, 0)
 
 
 def _fix(u):
@@ -128,23 +157,20 @@ def video_url(d):
 
 
 def music_url(d):
-    """Chỉ dùng làm TIẾNG cho video ghép. Không có nút tải nhạc."""
+    """Chỉ dùng làm tiếng cho video ghép – KHÔNG có nút tải nhạc."""
     mi = d.get("music_info") or {}
     return d.get("music") or mi.get("play") or mi.get("url")
 
 
 def image_urls(d):
-    """Ảnh tĩnh (jpg)."""
     return [u for u in (d.get("images") or []) if isinstance(u, str) and u]
 
 
 def live_urls(d):
-    """Clip live photo (mp4 có chuyển động)."""
     return [u for u in (d.get("live_images") or []) if isinstance(u, str) and u]
 
 
 def collect_items(d):
-    """Danh sách theo thứ tự bài đăng: ('p', url) ảnh, ('v', url) live photo."""
     imgs = image_urls(d)
     live = live_urls(d)
     items = []
@@ -160,7 +186,6 @@ def collect_items(d):
 
 
 def options_for(d):
-    """Chỉ 3 lựa chọn: ảnh – live photo – video."""
     opts = []
     if image_urls(d):
         opts.append("image")
@@ -171,37 +196,51 @@ def options_for(d):
     return opts
 
 
-# ---------- tải & gửi ----------
-def _download_urls(urls):
-    return [retry(lambda u=u: get_bytes(u)) for u in urls]
+# ---------- ffmpeg: chuyển 1 clip/ảnh thành mp4 chuẩn ----------
+def convert_clip(src, dst, kind):
+    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"]
+    if kind == "p":
+        cmd += ["-loop", "1", "-t", "3"]        # ảnh tĩnh -> 3 giây
+    else:
+        cmd += ["-fflags", "+genpts"]           # tạo lại timestamp cho clip lỗi
+    cmd += [
+        "-i", src,
+        "-vf", NORM,
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "26",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        dst,
+    ]
+    _run_ffmpeg(cmd)
+    frames, _ = _probe(dst)
+    if frames == 0:
+        raise RuntimeError("Clip nguồn không đọc được.")
+    return dst
 
 
+# ---------- gửi ----------
 async def send_images(msg, d):
     urls = image_urls(d)
     if not urls:
-        raise RuntimeError("Bài đăng không có ảnh tĩnh.")
+        raise RuntimeError("Bài đăng không có ảnh.")
 
-    for i in range(0, len(urls), 10):
-        part = urls[i:i + 10]
-        blobs = await asyncio.to_thread(_download_urls, part)
-
-        small = [b for b in blobs if len(b) <= MAX_PHOTO]
-        big = [b for b in blobs if len(b) > MAX_PHOTO]
-
-        if len(small) == 1:
-            await msg.reply_photo(photo=io.BytesIO(small[0]), caption="Ảnh 🖼")
-        elif small:
-            media = []
-            for b in small:
-                bio = io.BytesIO(b)
-                bio.name = "photo.jpg"
-                media.append(InputMediaPhoto(media=bio))
-            await msg.reply_media_group(media=media)
-
-        for b in big:   # ảnh >10MB gửi dạng file
-            bio = io.BytesIO(b)
-            bio.name = "photo.jpg"
-            await msg.reply_document(document=bio)
+    for i, u in enumerate(urls, 1):
+        b = await asyncio.to_thread(retry, lambda uu=u: get_bytes(uu))
+        if len(b) <= MAX_PHOTO:
+            try:
+                await msg.reply_photo(
+                    photo=io.BytesIO(b), caption=f"Ảnh {i}/{len(urls)} 🖼"
+                )
+                continue
+            except Exception:
+                log.warning("Gửi photo lỗi, chuyển sang document", exc_info=True)
+        bio = io.BytesIO(b)
+        bio.name = f"photo{i}.jpg"
+        await msg.reply_document(document=bio)
+        await asyncio.sleep(0.2)
 
 
 async def send_live(msg, d):
@@ -209,27 +248,27 @@ async def send_live(msg, d):
     if not urls:
         raise RuntimeError("Bài đăng không có live photo.")
 
-    for i in range(0, len(urls), 10):
-        part = urls[i:i + 10]
-        blobs = await asyncio.to_thread(_download_urls, part)
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, u in enumerate(urls, 1):
+            src = os.path.join(tmp, f"src{i}.mp4")
+            with open(src, "wb") as f:
+                f.write(await asyncio.to_thread(retry, lambda uu=u: get_bytes(uu)))
 
-        for b in blobs:
-            if len(b) > MAX_VIDEO:
+            dst = os.path.join(tmp, f"live{i}.mp4")
+            await asyncio.to_thread(convert_clip, src, dst, "v")
+
+            if os.path.getsize(dst) > MAX_VIDEO:
                 raise RuntimeError("Live photo lớn hơn 50MB.")
 
-        if len(blobs) == 1:
-            bio = io.BytesIO(blobs[0])
-            bio.name = "live.mp4"
-            await msg.reply_video(
-                video=bio, supports_streaming=True, caption="Live photo 📸"
-            )
-        else:
-            media = []
-            for b in blobs:
-                bio = io.BytesIO(b)
-                bio.name = "live.mp4"
-                media.append(InputMediaVideo(media=bio, supports_streaming=True))
-            await msg.reply_media_group(media=media)
+            with open(dst, "rb") as f:
+                await msg.reply_video(
+                    video=f,
+                    width=720,
+                    height=1280,
+                    supports_streaming=True,
+                    caption=f"Live photo {i}/{len(urls)} 📸",
+                )
+            await asyncio.sleep(0.3)
 
 
 async def send_original_video(msg, d):
@@ -238,17 +277,17 @@ async def send_original_video(msg, d):
         raise RuntimeError("Không tìm thấy link video.")
 
     with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "v.mp4")
+        src = os.path.join(tmp, "src.mp4")
+        with open(src, "wb") as f:
+            f.write(await asyncio.to_thread(retry, lambda: get_bytes(url)))
 
-        def _dl():
-            with open(path, "wb") as f:
-                f.write(retry(lambda: get_bytes(url)))
+        dst = os.path.join(tmp, "v.mp4")
+        await asyncio.to_thread(convert_clip, src, dst, "v")
 
-        await asyncio.to_thread(_dl)
-        if os.path.getsize(path) > MAX_VIDEO:
-            raise RuntimeError("Video lớn hơn 50MB, bot không gửi được.")
+        if os.path.getsize(dst) > MAX_VIDEO:
+            raise RuntimeError("Video lớn hơn 50MB.")
 
-        with open(path, "rb") as f:
+        with open(dst, "rb") as f:
             await msg.reply_video(
                 video=f,
                 width=720,
@@ -258,11 +297,11 @@ async def send_original_video(msg, d):
             )
 
 
-# ---------- ghép live photo thành 1 video, đúng tốc độ gốc ----------
+# ---------- ghép live photo -> 1 video, giữ tốc độ gốc ----------
 def make_merged(d, tmp):
     items = collect_items(d)
     if not items:
-        raise RuntimeError("Bài đăng không có nội dung để ghép video.")
+        raise RuntimeError("Bài đăng không có nội dung để ghép.")
 
     paths, kinds = [], []
     for idx, (kind, url) in enumerate(items):
@@ -274,240 +313,58 @@ def make_merged(d, tmp):
         kinds.append(kind)
 
     n = len(paths)
+    silent = os.path.join(tmp, "silent.mp4")
 
-    # chỉ chuẩn hoá khung hình, KHÔNG đổi tốc độ
-    vf = (
-        "fps=30,"
-        "scale=720:1280:force_original_aspect_ratio=decrease,"
-        "pad=720:1280:(ow-iw)/2:(oh-ih)/2,"
-        "setsar=1,format=yuv420p,"
-        "setpts=PTS-STARTPTS"
-    )
-
+    # BƯỚC 1: nối video (không audio, không -shortest)
     cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"]
     for p, kind in zip(paths, kinds):
         if kind == "p":
-            cmd += ["-loop", "1", "-t", "3", "-i", p]   # ảnh tĩnh: 3 giây
+            cmd += ["-loop", "1", "-t", "3", "-i", p]
         else:
-            cmd += ["-i", p]                             # live photo: nguyên tốc độ
+            cmd += ["-fflags", "+genpts", "-i", p]
 
-    music = os.path.join(tmp, "music.mp3")
-    has_music = False
-    mu = music_url(d)
-    if mu:
-        try:
-            with open(music, "wb") as f:
-                f.write(retry(lambda: get_bytes(mu)))
-            has_music = os.path.getsize(music) > 2048
-        except Exception:
-            log.warning("Không tải được nhạc nền", exc_info=True)
-
-    if has_music:
-        cmd += ["-stream_loop", "-1", "-i", music]
-
-    parts = [f"[{i}:v]{vf}[v{i}]" for i in range(n)]
+    parts = [f"[{i}:v]{NORM}[v{i}]" for i in range(n)]
     if n == 1:
         parts.append("[v0]null[v]")
     else:
         parts.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[v]")
 
-    cmd += ["-filter_complex", ";".join(parts), "-map", "[v]"]
-
-    if has_music:
-        cmd += ["-map", f"{n}:a", "-c:a", "aac", "-b:a", "128k", "-shortest"]
-
-    out = os.path.join(tmp, "merged.mp4")
     cmd += [
+        "-filter_complex", ";".join(parts),
+        "-map", "[v]",
+        "-an",
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "24",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
-        out,
+        silent,
     ]
+    _run_ffmpeg(cmd)
 
-    r = subprocess.run(cmd, capture_output=True, timeout=1200)
-    if r.returncode != 0 or not os.path.exists(out):
-        raise RuntimeError("Ghép video lỗi: " + r.stderr.decode(errors="ignore")[-200:])
-    return out
+    frames, secs = _probe(silent)
+    log.info("Video ghép: %s frame, %s giây", frames, secs)
+    if frames == 0:
+        raise RuntimeError("Không tạo được khung hình từ live photo.")
 
-
-async def send_merged(msg, d):
-    with tempfile.TemporaryDirectory() as tmp:
-        path = await asyncio.to_thread(make_merged, d, tmp)
-        if os.path.getsize(path) > MAX_VIDEO:
-            raise RuntimeError("Video ghép lớn hơn 50MB.")
-
-        with open(path, "rb") as f:
-            await msg.reply_video(
-                video=f,
-                width=720,
-                height=1280,
-                supports_streaming=True,
-                caption="Video 🎬",
-            )
-
-
-# ---------- nút VIDEO: bài video thì tải gốc, bài ảnh thì ghép live photo ----------
-async def send_video(msg, d):
-    if video_url(d):
-        await send_original_video(msg, d)
-    elif collect_items(d):
-        await send_merged(msg, d)
-    else:
-        raise RuntimeError("Bài đăng không có video.")
-
-
-async def run_choice(msg, d, what, errors):
-    if what in ("image", "all") and image_urls(d):
+    # BƯỚC 2: lồng nhạc (lặp vô hạn, dừng đúng lúc video hết)
+    final = silent
+    mu = music_url(d)
+    if mu:
+        music = os.path.join(tmp, "music.mp3")
         try:
-            await send_images(msg, d)
-        except Exception as e:
-            log.exception("image failed")
-            errors.append("ảnh: " + str(e)[:80])
-
-    if what in ("live", "all") and live_urls(d):
-        try:
-            await send_live(msg, d)
-        except Exception as e:
-            log.exception("live failed")
-            errors.append("live photo: " + str(e)[:80])
-
-    if what in ("video", "all") and (video_url(d) or collect_items(d)):
-        try:
-            await send_video(msg, d)
-        except Exception as e:
-            log.exception("video failed")
-            errors.append("video: " + str(e)[:80])
-
-
-# ---------- bàn phím: CHỈ 3 NÚT ----------
-LABEL = {
-    "image": "🖼 Ảnh",
-    "live": "📸 Live photo",
-    "video": "🎬 Video",
-}
-
-
-def build_keyboard(token, opts):
-    rows = [[InlineKeyboardButton(LABEL[o], callback_data=f"dl:{token}:{o}")] for o in opts]
-    if len(opts) > 1:
-        rows.append([InlineKeyboardButton("📦 Tải tất cả", callback_data=f"dl:{token}:all")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _clean_cache():
-    now = time.time()
-    for k in [k for k, v in CACHE.items() if now - v["ts"] > CACHE_TTL]:
-        CACHE.pop(k, None)
-
-
-# ---------- handlers ----------
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Gửi link TikTok, bạn chọn:\n"
-        "🖼 Ảnh\n"
-        "📸 Live photo\n"
-        "🎬 Video"
-    )
-
-
-async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
-    m = re.search(r"https?://\S+", text)
-    if not m:
-        await update.message.reply_text("Vui lòng gửi link hợp lệ.")
-        return
-
-    link = m.group(0)
-    if "tiktok.com" not in link:
-        await update.message.reply_text("Mình chỉ xử lý link TikTok.")
-        return
-
-    status = await update.message.reply_text("Đang lấy dữ liệu... ⏳")
-
-    try:
-        data = await asyncio.to_thread(tikwm, link)
-        opts = options_for(data)
-        if not opts:
-            raise RuntimeError("Bài đăng này không có ảnh/live photo/video.")
-
-        _clean_cache()
-        token = uuid.uuid4().hex[:10]
-        CACHE[token] = {"data": data, "ts": time.time()}
-
-        title = html.escape((data.get("title") or "").strip())[:200]
-        head = f"<b>{title}</b>\n\n" if title else ""
-        await status.edit_text(
-            head + "Chọn thứ bạn muốn tải:",
-            parse_mode="HTML",
-            reply_markup=build_keyboard(token, opts),
-        )
-    except Exception as e:
-        log.exception("prepare failed")
-        try:
-            await status.edit_text("Lỗi: " + str(e)[:200])
+            with open(music, "wb") as f:
+                f.write(retry(lambda: get_bytes(mu)))
         except Exception:
-            await update.message.reply_text("Lỗi: " + str(e)[:200])
+            log.warning("Không tải được nhạc nền", exc_info=True)
+            music = None
 
-
-async def handle_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q or not q.message:
-        return
-    await q.answer()
-
-    try:
-        _, token, what = (q.data or "").split(":", 2)
-    except ValueError:
-        await q.edit_message_text("Nút không hợp lệ.")
-        return
-
-    entry = CACHE.get(token)
-    if not entry:
-        await q.edit_message_text("Phiên đã hết hạn, hãy gửi lại link TikTok.")
-        return
-
-    data = entry["data"]
-    name = {"image": "ảnh 🖼", "live": "live photo 📸", "video": "video 🎬"}.get(
-        what, "tất cả 📦"
-    )
-
-    status = await q.message.reply_text(f"Đang tải {name}... ⏳")
-    t0 = time.time()
-    errors = []
-
-    await run_choice(q.message, data, what, errors)
-
-    try:
-        if errors:
-            await status.edit_text("Lỗi: " + " | ".join(errors)[:300])
-        else:
-            await status.delete()
-            await q.message.reply_text("Xong trong %.1f giây." % (time.time() - t0))
-    except Exception:
-        log.exception("edit status failed")
-
-
-# ---------- khởi động ----------
-def _ensure_event_loop():
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            raise RuntimeError("loop closed")
-    except Exception:
-        asyncio.set_event_loop(asyncio.new_event_loop())
-
-
-if __name__ == "__main__":
-    threading.Thread(target=_run_health, daemon=True).start()
-
-    _ensure_event_loop()
-
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle_choice, pattern=r"^dl:"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    log.info("Bot đang chạy...")
-    app.run_polling(drop_pending_updates=True)
+        if music and os.path.getsize(music) > 2048:
+            final = os.path.join(tmp, "merged.mp4")
+            _run_ffmpeg([
+                FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", silent,
+                "-stream_loop", "-1", "-i", music,
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a",
