@@ -10,6 +10,7 @@ UA = {"User-Agent": "Mozilla/5.0"}
 MAXV, MAXP = 50 * 1024 * 1024, 10 * 1024 * 1024
 W, H, FPS, STATIC = 720, 1280, 30, 3.0
 MODE = os.environ.get("MODE", "merged").lower()
+FILL = os.environ.get("FILL", "1") == "1"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
 SEM = None
@@ -128,6 +129,19 @@ def build(d, wd, out):
         o = os.path.join(wd, f"c{i:02d}.mp4")
         fit(src, o, loop=(k == "p"), t=per)
         clips.append(o)
+
+    if FILL and audio and total > 0:
+        have = sum(dur(c) for c in clips)
+        if have > 0.1 and have < total - 0.3:
+            reps = min(int(total / have) + 1, 40)
+            base = list(clips)
+            for r in range(1, reps):
+                for c in base:
+                    n = os.path.join(wd, "r%d_%s" % (r, os.path.basename(c)))
+                    shutil.copy(c, n)
+                    clips.append(n)
+            log.info("lặp %dx → %.1fs", reps, have * reps)
+
     lst = os.path.join(wd, "l.txt")
     with open(lst, "w", encoding="utf-8") as f:
         for c in clips: f.write("file '%s'\n" % os.path.abspath(c).replace("'", "'\\''"))
@@ -146,7 +160,7 @@ def build(d, wd, out):
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
             "-c:a", "aac", "-b:a", "96k", small])
         shutil.move(small, out)
-    return out, len(it), dur(out)
+    return out, len(clips), dur(out)
 
 def media(k, b):
     bio = io.BytesIO(b); bio.name = "live.mp4" if k == "v" else "photo.jpg"
@@ -186,15 +200,39 @@ async def notify(ctx, u):
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await notify(ctx, update.effective_user)
-    await update.message.reply_text("Gửi link TikTok. Hỗ trợ video, ảnh, live photo.\nChế độ: " + MODE)
+    await update.message.reply_text(f"Gửi link TikTok.\nChế độ: {MODE} · FILL: {FILL}")
 
 async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global MODE
-    a = ctx.args[0].lower() if ctx.args else ""
+    global MODE, FILL
+    a = (ctx.args[0].lower() if ctx.args else "")
     if a in ("album", "merged"):
-        MODE = a; await update.message.reply_text("Chế độ: " + MODE)
+        MODE = a
+    elif a in ("fill", "nofill"):
+        FILL = (a == "fill")
     else:
-        await update.message.reply_text("Dùng: /mode merged | /mode album")
+        await update.message.reply_text("Dùng: /mode merged | album | fill | nofill")
+        return
+    await update.message.reply_text(f"MODE={MODE} FILL={FILL}")
+
+async def raw_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    m = re.search(r"https?://\S+", update.message.text or "")
+    if not m:
+        await update.message.reply_text("Dùng: /raw <link>")
+        return
+    try:
+        d = await asyncio.to_thread(tikwm, m.group(0))
+    except Exception as e:
+        await update.message.reply_text("Lỗi: " + str(e)[:150])
+        return
+    lines = []
+    for k, v in d.items():
+        if isinstance(v, list):
+            lines.append(f"{k}: list[{len(v)}]")
+        elif isinstance(v, (int, float, str)):
+            lines.append(f"{k}: {v}")
+        else:
+            lines.append(f"{k}: {type(v).__name__}")
+    await update.message.reply_text(("RAW\n" + "\n".join(lines))[:3900])
 
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await notify(ctx, update.effective_user)
@@ -242,7 +280,7 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         await update.message.reply_video(
                             video=f, width=W, height=H, duration=max(1, int(round(du))),
                             supports_streaming=True,
-                            caption=f"{title}\n{n} slide · {du:.1f}s 🎞")
+                            caption=f"{title}\n{n} clip · {du:.1f}s 🎞")
                 finally:
                     shutil.rmtree(wd, ignore_errors=True)
             await st.delete()
@@ -257,6 +295,7 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("mode", mode_cmd))
+    app.add_handler(CommandHandler("raw", raw_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
-    log.info("chạy — mode=%s", MODE)
+    log.info("chạy — mode=%s fill=%s", MODE, FILL)
     app.run_polling()
