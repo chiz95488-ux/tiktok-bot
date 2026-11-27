@@ -32,7 +32,6 @@ try:
     import imageio_ffmpeg
     FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:
-    imageio_ffmpeg = None
     FFMPEG = "ffmpeg"
 
 # ================= CẤU HÌNH =================
@@ -129,124 +128,114 @@ def video_url(d):
 
 
 def music_url(d):
-    """Chỉ dùng làm nhạc nền cho video ghép (không còn nút tải nhạc)."""
+    """Chỉ dùng làm TIẾNG cho video ghép. Không có nút tải nhạc."""
     mi = d.get("music_info") or {}
     return d.get("music") or mi.get("play") or mi.get("url")
 
 
 def image_urls(d):
+    """Ảnh tĩnh (jpg)."""
     return [u for u in (d.get("images") or []) if isinstance(u, str) and u]
 
 
+def live_urls(d):
+    """Clip live photo (mp4 có chuyển động)."""
+    return [u for u in (d.get("live_images") or []) if isinstance(u, str) and u]
+
+
 def collect_items(d):
-    """('p', url) ảnh tĩnh, ('v', url) live photo (mp4)."""
+    """Danh sách theo thứ tự bài đăng: ('p', url) ảnh, ('v', url) live photo."""
     imgs = image_urls(d)
-    live = d.get("live_images") or []
+    live = live_urls(d)
     items = []
     for i, img in enumerate(imgs):
-        lv = live[i] if i < len(live) and isinstance(live[i], str) and live[i] else None
+        lv = live[i] if i < len(live) else None
         if lv:
             items.append(("v", lv))
         elif img:
             items.append(("p", img))
     if not items and live:
-        items = [("v", x) for x in live if isinstance(x, str) and x]
+        items = [("v", x) for x in live]
     return items
 
 
-def _to_seconds(v):
-    try:
-        v = float(v)
-    except (TypeError, ValueError):
-        return 0.0
-    if v <= 0:
-        return 0.0
-    if v > 1000:          # một số API trả về mili giây
-        v = v / 1000.0
-    return v
-
-
-def post_duration(d):
-    """Độ dài bài đăng gốc (giây)."""
-    mi = d.get("music_info") or {}
-    best = max(_to_seconds(d.get("duration")), _to_seconds(mi.get("duration")))
-    if best <= 0:
-        best = 15.0
-    return max(3.0, min(best, 600.0))
-
-
-def clip_duration(path, default=3.0):
-    """Đo độ dài clip live photo bằng chính ffmpeg."""
-    if imageio_ffmpeg is None:
-        return default
-    try:
-        _, secs = imageio_ffmpeg.count_frames_and_secs(path)
-        if secs and float(secs) > 0:
-            return float(secs)
-    except Exception:
-        pass
-    return default
-
-
 def options_for(d):
+    """Chỉ 3 lựa chọn: ảnh – live photo – video."""
     opts = []
-    if collect_items(d):
-        opts.append("photo")
-        opts.append("merged")
-    if video_url(d):
+    if image_urls(d):
+        opts.append("image")
+    if live_urls(d):
+        opts.append("live")
+    if video_url(d) or collect_items(d):
         opts.append("video")
     return opts
 
 
 # ---------- tải & gửi ----------
-def _download_part(part):
-    out = []
-    for kind, url in part:
-        out.append((kind, retry(lambda u=url: get_bytes(u))))
-    return out
+def _download_urls(urls):
+    return [retry(lambda u=u: get_bytes(u)) for u in urls]
 
 
-def _media_for(kind, data):
-    bio = io.BytesIO(data)
-    if kind == "v":
-        bio.name = "live.mp4"
-        return InputMediaVideo(media=bio, supports_streaming=True)
-    bio.name = "photo.jpg"
-    return InputMediaPhoto(media=bio)
+async def send_images(msg, d):
+    urls = image_urls(d)
+    if not urls:
+        raise RuntimeError("Bài đăng không có ảnh tĩnh.")
+
+    for i in range(0, len(urls), 10):
+        part = urls[i:i + 10]
+        blobs = await asyncio.to_thread(_download_urls, part)
+
+        small = [b for b in blobs if len(b) <= MAX_PHOTO]
+        big = [b for b in blobs if len(b) > MAX_PHOTO]
+
+        if len(small) == 1:
+            await msg.reply_photo(photo=io.BytesIO(small[0]), caption="Ảnh 🖼")
+        elif small:
+            media = []
+            for b in small:
+                bio = io.BytesIO(b)
+                bio.name = "photo.jpg"
+                media.append(InputMediaPhoto(media=bio))
+            await msg.reply_media_group(media=media)
+
+        for b in big:   # ảnh >10MB gửi dạng file
+            bio = io.BytesIO(b)
+            bio.name = "photo.jpg"
+            await msg.reply_document(document=bio)
 
 
-async def send_photos(msg, d):
-    items = collect_items(d)
-    if not items:
-        raise RuntimeError("Bài đăng không có ảnh / live photo nào.")
+async def send_live(msg, d):
+    urls = live_urls(d)
+    if not urls:
+        raise RuntimeError("Bài đăng không có live photo.")
 
-    for i in range(0, len(items), 10):
-        part = items[i:i + 10]
-        blobs = await asyncio.to_thread(_download_part, part)
+    for i in range(0, len(urls), 10):
+        part = urls[i:i + 10]
+        blobs = await asyncio.to_thread(_download_urls, part)
 
-        for k, b in blobs:
-            limit = MAX_VIDEO if k == "v" else MAX_PHOTO
-            if len(b) > limit:
-                raise RuntimeError("Có file vượt giới hạn Telegram (ảnh 10MB / video 50MB).")
+        for b in blobs:
+            if len(b) > MAX_VIDEO:
+                raise RuntimeError("Live photo lớn hơn 50MB.")
 
         if len(blobs) == 1:
-            k, b = blobs[0]
-            if k == "v":
+            bio = io.BytesIO(blobs[0])
+            bio.name = "live.mp4"
+            await msg.reply_video(
+                video=bio, supports_streaming=True, caption="Live photo 📸"
+            )
+        else:
+            media = []
+            for b in blobs:
                 bio = io.BytesIO(b)
                 bio.name = "live.mp4"
-                await msg.reply_video(
-                    video=bio, supports_streaming=True, caption="Live photo 📸"
-                )
-            else:
-                await msg.reply_photo(photo=io.BytesIO(b), caption="Ảnh của bạn đây! 📸")
-        else:
-            await msg.reply_media_group(media=[_media_for(k, b) for k, b in blobs])
+                media.append(InputMediaVideo(media=bio, supports_streaming=True))
+            await msg.reply_media_group(media=media)
 
 
-async def send_video(msg, d):
+async def send_original_video(msg, d):
     url = video_url(d)
     if not url:
-        raise RuntimeError("Không tìm thấy link tải video.")
+        raise RuntimeError("Không tìm thấy link video.")
 
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "v.mp4")
@@ -265,24 +254,15 @@ async def send_video(msg, d):
                 width=720,
                 height=1280,
                 supports_streaming=True,
-                caption="Video của bạn đây! 🎬",
+                caption="Video 🎬",
             )
 
 
-# ---------- VIDEO GHÉP: GIỮ CHUYỂN ĐỘNG LIVE PHOTO ----------
-def make_live_video(d, tmp):
-    """
-    Nối các clip live photo (giữ chuyển động) + ảnh tĩnh (nếu có)
-    lại thành 1 video đúng độ dài bài gốc, kèm nhạc nền.
-    Clip live được kéo dãn / tua tốc nhẹ để vừa đúng thời lượng.
-    """
+# ---------- ghép live photo thành 1 video, đúng tốc độ gốc ----------
+def make_merged(d, tmp):
     items = collect_items(d)
     if not items:
-        raise RuntimeError("Bài đăng không có ảnh / live photo để ghép.")
-
-    n = len(items)
-    total = post_duration(d)
-    per = max(0.6, total / n)          # thời lượng mỗi khung
+        raise RuntimeError("Bài đăng không có nội dung để ghép video.")
 
     paths, kinds = [], []
     for idx, (kind, url) in enumerate(items):
@@ -293,7 +273,24 @@ def make_live_video(d, tmp):
         paths.append(p)
         kinds.append(kind)
 
-    # nhạc nền
+    n = len(paths)
+
+    # chỉ chuẩn hoá khung hình, KHÔNG đổi tốc độ
+    vf = (
+        "fps=30,"
+        "scale=720:1280:force_original_aspect_ratio=decrease,"
+        "pad=720:1280:(ow-iw)/2:(oh-ih)/2,"
+        "setsar=1,format=yuv420p,"
+        "setpts=PTS-STARTPTS"
+    )
+
+    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"]
+    for p, kind in zip(paths, kinds):
+        if kind == "p":
+            cmd += ["-loop", "1", "-t", "3", "-i", p]   # ảnh tĩnh: 3 giây
+        else:
+            cmd += ["-i", p]                             # live photo: nguyên tốc độ
+
     music = os.path.join(tmp, "music.mp3")
     has_music = False
     mu = music_url(d)
@@ -305,45 +302,19 @@ def make_live_video(d, tmp):
         except Exception:
             log.warning("Không tải được nhạc nền", exc_info=True)
 
-    vf = (
-        "fps=25,"
-        "scale=720:1280:force_original_aspect_ratio=decrease,"
-        "pad=720:1280:(ow-iw)/2:(oh-ih)/2,"
-        "setsar=1,format=yuv420p"
-    )
-
-    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error"]
-    for p, kind in zip(paths, kinds):
-        if kind == "p":
-            cmd += ["-loop", "1", "-t", f"{per:.3f}", "-i", p]
-        else:
-            cmd += ["-i", p]
     if has_music:
-        cmd += ["-i", music]
+        cmd += ["-stream_loop", "-1", "-i", music]
 
-    parts = []
-    for i, (p, kind) in enumerate(zip(paths, kinds)):
-        if kind == "p":
-            parts.append(f"[{i}:v]{vf}[v{i}]")
-        else:
-            dur = clip_duration(p, default=per)
-            # hệ số nhân PTS: >1 = chậm lại, <1 = nhanh lên
-            factor = per / dur if dur > 0 else 1.0
-            factor = max(0.5, min(2.0, factor))
-            parts.append(
-                f"[{i}:v]setpts=(PTS-STARTPTS)*{factor:.4f},{vf},"
-                f"tpad=stop_mode=clone:stop_duration={per:.3f},"
-                f"trim=duration={per:.3f},setpts=PTS-STARTPTS[v{i}]"
-            )
-
+    parts = [f"[{i}:v]{vf}[v{i}]" for i in range(n)]
     if n == 1:
         parts.append("[v0]null[v]")
     else:
         parts.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[v]")
 
     cmd += ["-filter_complex", ";".join(parts), "-map", "[v]"]
+
     if has_music:
-        cmd += ["-map", f"{n}:a", "-c:a", "aac", "-b:a", "128k"]
+        cmd += ["-map", f"{n}:a", "-c:a", "aac", "-b:a", "128k", "-shortest"]
 
     out = os.path.join(tmp, "merged.mp4")
     cmd += [
@@ -352,11 +323,9 @@ def make_live_video(d, tmp):
         "-crf", "24",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
-        "-t", f"{n * per:.3f}",
         out,
     ]
 
-    log.info("Ghép video: %d khung, mỗi khung %.2fs, tổng %.1fs", n, per, n * per)
     r = subprocess.run(cmd, capture_output=True, timeout=1200)
     if r.returncode != 0 or not os.path.exists(out):
         raise RuntimeError("Ghép video lỗi: " + r.stderr.decode(errors="ignore")[-200:])
@@ -365,9 +334,9 @@ def make_live_video(d, tmp):
 
 async def send_merged(msg, d):
     with tempfile.TemporaryDirectory() as tmp:
-        path = await asyncio.to_thread(make_live_video, d, tmp)
+        path = await asyncio.to_thread(make_merged, d, tmp)
         if os.path.getsize(path) > MAX_VIDEO:
-            raise RuntimeError("Video ghép lớn hơn 50MB, không gửi được.")
+            raise RuntimeError("Video ghép lớn hơn 50MB.")
 
         with open(path, "rb") as f:
             await msg.reply_video(
@@ -375,27 +344,36 @@ async def send_merged(msg, d):
                 width=720,
                 height=1280,
                 supports_streaming=True,
-                duration=int(post_duration(d)),
-                caption="Video ghép từ live photo + nhạc 🎬",
+                caption="Video 🎬",
             )
 
 
+# ---------- nút VIDEO: bài video thì tải gốc, bài ảnh thì ghép live photo ----------
+async def send_video(msg, d):
+    if video_url(d):
+        await send_original_video(msg, d)
+    elif collect_items(d):
+        await send_merged(msg, d)
+    else:
+        raise RuntimeError("Bài đăng không có video.")
+
+
 async def run_choice(msg, d, what, errors):
-    if what in ("photo", "all") and collect_items(d):
+    if what in ("image", "all") and image_urls(d):
         try:
-            await send_photos(msg, d)
+            await send_images(msg, d)
         except Exception as e:
-            log.exception("photo failed")
+            log.exception("image failed")
             errors.append("ảnh: " + str(e)[:80])
 
-    if what == "merged" and collect_items(d):
+    if what in ("live", "all") and live_urls(d):
         try:
-            await send_merged(msg, d)
+            await send_live(msg, d)
         except Exception as e:
-            log.exception("merged failed")
-            errors.append("video ghép: " + str(e)[:80])
+            log.exception("live failed")
+            errors.append("live photo: " + str(e)[:80])
 
-    if what in ("video", "all") and video_url(d):
+    if what in ("video", "all") and (video_url(d) or collect_items(d)):
         try:
             await send_video(msg, d)
         except Exception as e:
@@ -403,10 +381,10 @@ async def run_choice(msg, d, what, errors):
             errors.append("video: " + str(e)[:80])
 
 
-# ---------- bàn phím ----------
+# ---------- bàn phím: CHỈ 3 NÚT ----------
 LABEL = {
-    "photo": "🖼 Ảnh / live photo",
-    "merged": "🎬 Video dài (live + nhạc)",
+    "image": "🖼 Ảnh",
+    "live": "📸 Live photo",
     "video": "🎬 Video",
 }
 
@@ -427,11 +405,10 @@ def _clean_cache():
 # ---------- handlers ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Gửi link TikTok, mình sẽ cho bạn chọn:\n"
-        "🖼 Ảnh / live photo gốc\n"
-        "🎬 Video dài (live + nhạc) – ghép tất cả live photo giữ chuyển động, "
-        "dài đúng bằng bài gốc\n"
-        "🎬 Video (bài video thường)"
+        "Gửi link TikTok, bạn chọn:\n"
+        "🖼 Ảnh\n"
+        "📸 Live photo\n"
+        "🎬 Video"
     )
 
 
@@ -453,7 +430,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         data = await asyncio.to_thread(tikwm, link)
         opts = options_for(data)
         if not opts:
-            raise RuntimeError("Bài đăng này không có ảnh/video để tải.")
+            raise RuntimeError("Bài đăng này không có ảnh/live photo/video.")
 
         _clean_cache()
         token = uuid.uuid4().hex[:10]
@@ -492,11 +469,9 @@ async def handle_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     data = entry["data"]
-    name = {
-        "photo": "ảnh 🖼",
-        "merged": "video ghép 🎬",
-        "video": "video 🎬",
-    }.get(what, "tất cả 📦")
+    name = {"image": "ảnh 🖼", "live": "live photo 📸", "video": "video 🎬"}.get(
+        what, "tất cả 📦"
+    )
 
     status = await q.message.reply_text(f"Đang tải {name}... ⏳")
     t0 = time.time()
